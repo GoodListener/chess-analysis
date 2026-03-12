@@ -1,24 +1,66 @@
 'use client';
 
-import { Suspense, useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { Suspense, useState, useEffect, useMemo, useRef } from 'react';
 import { useSearchParams } from 'next/navigation';
-import { Chess, Move } from 'chess.js';
+import { Chess, Square, Move } from 'chess.js';
 import { Chessboard } from 'react-chessboard';
 import { useStockfish, Evaluation } from '@/hooks/use-stockfish';
-import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, BarChart2, Star, CheckCircle, AlertCircle, XCircle, Info, Loader2, BookOpen } from 'lucide-react';
+import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, BarChart2, Loader2, RefreshCw, BookOpen, Star, CheckCircle, Info, AlertCircle, XCircle, Lightbulb } from 'lucide-react';
 import Link from 'next/link';
+
+interface CloudEvalPV {
+  cp?: number;
+  mate?: number;
+  moves: string;
+}
+
+interface CloudEvalData {
+  depth: number;
+  knps?: number;
+  pvs: CloudEvalPV[];
+  opening?: {
+    eco: string;
+    name: string;
+  };
+}
+
+interface ExtendedEvaluation extends Evaluation {
+  knps?: number;
+}
 
 type MoveQuality = 'brilliant' | 'great' | 'best' | 'excellent' | 'good' | 'inaccuracy' | 'mistake' | 'blunder' | 'book';
 
-function getMoveQuality(current: Evaluation | null, previous: Evaluation | null, isWhite: boolean): { quality: MoveQuality; label: string; color: string } {
-  if (current?.isBook) return { quality: 'book', label: 'Book Move', color: 'text-purple-500' };
+interface QualityInfo {
+  quality: MoveQuality;
+  label: string;
+  color: string;
+  bestMove?: string;
+}
 
-  if (!current || !previous) return { quality: 'good', label: 'Good', color: 'text-slate-400' };
+function getMoveQuality(current: ExtendedEvaluation | null, previous: ExtendedEvaluation | null, isWhite: boolean): QualityInfo | null {
+  if (!current || !previous) return null;
+  if (current.isBook) return { quality: 'book', label: 'Book Move', color: 'text-purple-500' };
 
   const currVal = current.type === 'mate' ? (current.value > 0 ? 1000 : -1000) : current.value;
   const prevVal = previous.type === 'mate' ? (previous.value > 0 ? 1000 : -1000) : previous.value;
   
   const diff = isWhite ? (currVal - prevVal) : (prevVal - currVal);
+
+  // Brilliant/Great logic using Multi-PV if available
+  let isOnlyGoodMove = false;
+  if (previous.pvs && previous.pvs.length >= 2) {
+      const bestVal = previous.pvs[0].type === 'mate' ? (previous.pvs[0].value > 0 ? 1000 : -1000) : previous.pvs[0].value;
+      const secondBestVal = previous.pvs[1].type === 'mate' ? (previous.pvs[1].value > 0 ? 1000 : -1000) : previous.pvs[1].value;
+      const valDiff = isWhite ? (bestVal - secondBestVal) : (secondBestVal - bestVal);
+      if (valDiff > 150 && diff > -50) {
+          isOnlyGoodMove = true;
+      }
+  }
+
+  if (isOnlyGoodMove) {
+      if (diff > -20) return { quality: 'brilliant', label: 'Brilliant!!', color: 'text-cyan-500' };
+      return { quality: 'great', label: 'Great!', color: 'text-blue-500' };
+  }
 
   if (diff > 200) return { quality: 'brilliant', label: 'Brilliant!!', color: 'text-cyan-500' };
   if (diff > 100) return { quality: 'great', label: 'Great!', color: 'text-blue-500' };
@@ -46,214 +88,371 @@ function QualityIcon({ quality }: { quality: MoveQuality }) {
 function AnalysisContent() {
   const searchParams = useSearchParams();
   const pgn = searchParams.get('pgn');
-  const [game, setGame] = useState(new Chess());
+  const [opening, setOpening] = useState<string>('');
+  const [evalCache, setEvalCache] = useState<Record<number, ExtendedEvaluation>>({});
+  const evalCacheRef = useRef<Record<number, ExtendedEvaluation>>({});
+  
+  const moves = useMemo<Move[]>(() => {
+    if (!pgn) return [];
+    const tempGame = new Chess();
+    try {
+      tempGame.loadPgn(pgn);
+      return tempGame.history({ verbose: true });
+    } catch (e) {
+      console.error("Failed to load PGN", e);
+      return [];
+    }
+  }, [pgn]);
+
   const [moveIndex, setMoveIndex] = useState(0);
-  const [moves, setMoves] = useState<Move[]>([]);
-  const [evaluations, setEvaluations] = useState<Evaluation[]>([]);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const { analyze, isReady } = useStockfish();
-  const analysisStarted = useRef(false);
+  const [boardOrientation, setBoardOrientation] = useState<'white' | 'black'>('white');
+  const [cloudEval, setCloudEval] = useState<CloudEvalData | null>(null);
+  const { analyze, isReady, evaluation: liveEval, stop } = useStockfish();
 
-  // Initial Full Analysis
-  useEffect(() => {
-    if (isReady && pgn && !analysisStarted.current && evaluations.length === 0) {
-      analysisStarted.current = true;
-      const runFullAnalysis = async () => {
-        setAnalyzing(true);
-        const tempGame = new Chess();
-        tempGame.loadPgn(pgn);
-        const history = tempGame.history({ verbose: true });
-        setMoves(history);
-
-        const evals: Evaluation[] = [];
-        const analysisGame = new Chess();
-        
-        // Initial position evaluation
-        const startEval = await analyze(analysisGame.fen(), 10);
-        startEval.isBook = true;
-        evals.push(startEval);
-
-        let inBook = true;
-
-        for (let i = 0; i < history.length; i++) {
-          const move = history[i];
-          const previousFen = analysisGame.fen();
-          analysisGame.move(move);
-          
-          let isBookMove = false;
-          if (inBook && i < 30) { // Check first 30 plies (15 full moves)
-            try {
-              const res = await fetch(`https://explorer.lichess.ovh/masters?fen=${encodeURIComponent(previousFen)}&moves=5`);
-              if (res.ok) {
-                const data = await res.json();
-                if (data.moves && data.moves.some((m: any) => m.san === move.san)) {
-                  isBookMove = true;
-                } else {
-                  inBook = false;
-                }
-              } else {
-                inBook = false; // Stop checking on API error or rate limit
-              }
-            } catch (e) {
-              console.error("Lichess API error", e);
-              inBook = false;
-            }
-            // Small delay to prevent rate-limiting from Lichess (limit is 15 requests / second)
-            await new Promise(r => setTimeout(r, 70));
-          } else {
-            inBook = false;
-          }
-
-          let result;
-          if (analysisGame.isCheckmate()) {
-            // If it's white's turn to move and they are in checkmate, black won (negative mate score).
-            result = { type: 'mate', value: analysisGame.turn() === 'w' ? -0 : 0 } as Evaluation;
-          } else if (analysisGame.isDraw()) {
-            result = { type: 'cp', value: 0 } as Evaluation;
-          } else {
-            result = await analyze(analysisGame.fen(), 8);
-          }
-          
-          result.isBook = isBookMove;
-          evals.push(result);
-          setProgress(Math.round(((i + 1) / history.length) * 100));
-        }
-
-        setEvaluations(evals);
-        setAnalyzing(false);
-        setMoveIndex(0); // Ensure we start at the beginning
-      };
-
-      runFullAnalysis();
-    }
-  }, [pgn, isReady, analyze, evaluations.length]);
-
-  const currentEval = evaluations[moveIndex] || null;
-  const prevEval = moveIndex > 0 ? evaluations[moveIndex - 1] : null;
-
-  const goToMove = useCallback((index: number) => {
+  const game = useMemo(() => {
     const newGame = new Chess();
-    for (let i = 0; i < index; i++) {
-      newGame.move(moves[i]);
+    for (let i = 0; i < moveIndex; i++) {
+      if (moves[i]) newGame.move(moves[i]);
     }
-    setGame(newGame);
-    setMoveIndex(index);
-  }, [moves]);
+    return newGame;
+  }, [moves, moveIndex]);
 
-  const handleNext = () => moveIndex < moves.length && goToMove(moveIndex + 1);
-  const handlePrev = () => moveIndex > 0 && goToMove(moveIndex - 1);
-  const handleFirst = () => goToMove(0);
-  const handleLast = () => goToMove(moves.length);
+  const updateCache = (index: number, evaluation: ExtendedEvaluation) => {
+    const current = evalCacheRef.current[index];
+    if (!current || (evaluation.depth && (!current.depth || evaluation.depth > current.depth))) {
+      evalCacheRef.current[index] = { ...current, ...evaluation };
+      setEvalCache({ ...evalCacheRef.current });
+    }
+  };
+
+  // Fetch Opening Name and Cloud Eval
+  useEffect(() => {
+    const fetchAnalysisData = async () => {
+      const fen = game.fen();
+      const currentIndex = moveIndex;
+
+      // Don't fetch if game is over
+      if (game.isGameOver()) {
+        const result: ExtendedEvaluation = game.isCheckmate() 
+          ? { type: 'mate', value: game.turn() === 'w' ? -0 : 0, depth: 0 }
+          : { type: 'cp', value: 0, depth: 0 };
+        updateCache(currentIndex, result);
+        return;
+      }
+      
+      // Fetch Cloud Eval
+      setCloudEval(null);
+      try {
+        const res = await fetch(`/api/lichess?fen=${encodeURIComponent(fen)}&type=cloud-eval`);
+        if (res.ok) {
+          const data = await res.json() as CloudEvalData | null;
+          if (data) {
+            setCloudEval(data);
+            updateCache(currentIndex, {
+              type: (data.pvs[0].cp !== undefined ? 'cp' : 'mate'),
+              value: data.pvs[0].cp !== undefined ? data.pvs[0].cp : (data.pvs[0].mate ?? 0),
+              depth: data.depth,
+              isCloud: true,
+              pvs: data.pvs.map(pv => ({
+                type: (pv.cp !== undefined ? 'cp' : 'mate'),
+                value: pv.cp !== undefined ? pv.cp : (pv.mate ?? 0),
+                move: pv.moves.split(' ')[0]
+              }))
+            });
+          }
+        }
+      } catch (e) {
+        console.error('Cloud Eval error', e);
+      }
+
+      // Fetch Opening Explorer data for opening name
+      try {
+        const res = await fetch(`/api/lichess?fen=${encodeURIComponent(fen)}&type=explorer`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.opening) {
+            setOpening(`${data.opening.eco}: ${data.opening.name}`);
+            updateCache(currentIndex, { isBook: true, type: 'cp', value: 0 });
+          }
+        }
+      } catch (e) {
+        console.error('Opening Explorer error', e);
+      }
+    };
+    fetchAnalysisData();
+  }, [game, moveIndex]);
+
+  // Real-time continuous analysis
+  useEffect(() => {
+    if (isReady && game) {
+      analyze(game.fen(), 24);
+      return () => stop();
+    }
+  }, [game, isReady, analyze, stop]);
+
+  // Update cache from live engine
+  useEffect(() => {
+    if (liveEval && !cloudEval) {
+      updateCache(moveIndex, liveEval);
+    }
+  }, [liveEval, moveIndex, cloudEval]);
+
+  const handleNext = () => moveIndex < moves.length && setMoveIndex(moveIndex + 1);
+  const handlePrev = () => moveIndex > 0 && setMoveIndex(moveIndex - 1);
+  const handleFirst = () => setMoveIndex(0);
+  const handleLast = () => setMoveIndex(moves.length);
+
+  // displayEval: current position score
+  const displayEval = useMemo<ExtendedEvaluation | null>(() => {
+    if (cloudEval && cloudEval.pvs && cloudEval.pvs.length > 0) {
+      return {
+        type: (cloudEval.pvs[0].cp !== undefined ? 'cp' : 'mate') as 'cp' | 'mate',
+        value: cloudEval.pvs[0].cp !== undefined ? cloudEval.pvs[0].cp : (cloudEval.pvs[0].mate ?? 0),
+        depth: cloudEval.depth,
+        knps: cloudEval.knps,
+        isCloud: true,
+        pvs: cloudEval.pvs.map((pv) => ({
+          type: (pv.cp !== undefined ? 'cp' : 'mate') as 'cp' | 'mate',
+          value: pv.cp !== undefined ? pv.cp : (pv.mate ?? 0),
+          move: pv.moves.split(' ')[0]
+        }))
+      };
+    }
+    return liveEval;
+  }, [cloudEval, liveEval]);
 
   const evalValue = useMemo(() => {
-    if (!currentEval) return 0;
-    if (currentEval.type === 'mate') return currentEval.value > 0 ? 10 : -10;
-    return Math.max(Math.min(currentEval.value / 100, 10), -10);
-  }, [currentEval]);
+    if (!displayEval) return 0;
+    if (displayEval.type === 'mate') return displayEval.value > 0 ? 10 : -10;
+    return Math.max(Math.min(displayEval.value / 100, 10), -10);
+  }, [displayEval]);
 
   const barHeight = `${50 + (evalValue * 5)}%`;
 
-  const qualityInfo = useMemo(() => {
-    if (moveIndex === 0) return null;
-    return getMoveQuality(currentEval, prevEval, moveIndex % 2 !== 0);
-  }, [currentEval, prevEval, moveIndex]);
+  const formatUci = (uci: string) => {
+    if (!uci) return '';
+    return uci.substring(0, 2) + ' → ' + uci.substring(2, 4);
+  };
 
-  if (analyzing) {
-    return (
-      <div className="flex flex-col items-center justify-center h-[600px] gap-6 bg-white rounded-3xl shadow-xl border border-slate-200 p-12 text-center">
-        <div className="relative">
-           <Loader2 className="w-20 h-20 text-blue-600 animate-spin" />
-           <div className="absolute inset-0 flex items-center justify-center font-black text-blue-600 text-sm">
-             {progress}%
-           </div>
-        </div>
-        <div>
-          <h2 className="text-2xl font-black text-slate-900 mb-2">Analyzing Game...</h2>
-          <p className="text-slate-500 max-w-sm">
-            Stockfish is calculating all moves to provide a complete game review. This may take a few seconds.
-          </p>
-        </div>
-        <div className="w-full max-w-md bg-slate-100 h-3 rounded-full overflow-hidden">
-           <div className="bg-blue-600 h-full transition-all duration-300" style={{ width: `${progress}%` }} />
-        </div>
-      </div>
-    );
-  }
+  const qualityInfo = useMemo<QualityInfo | null>(() => {
+    if (moveIndex === 0) return null;
+    const current = evalCache[moveIndex];
+    const previous = evalCache[moveIndex - 1];
+    const info = getMoveQuality(current, previous, moveIndex % 2 !== 0);
+    
+    if (info && previous?.pvs && previous.pvs.length > 0) {
+        const playedMove = moves[moveIndex - 1];
+        const playedUci = playedMove.from + playedMove.to + (playedMove.promotion || '');
+        const bestUci = previous.pvs[0].move;
+        
+        if (playedUci !== bestUci) {
+            return { ...info, bestMove: previous.pvs[0].move };
+        }
+    }
+    return info;
+  }, [evalCache, moveIndex, moves]);
+
+  // recommendations: alternatives for the MOVE JUST PLAYED
+  const recommendations = useMemo(() => {
+    if (moveIndex === 0) return displayEval?.pvs || [];
+    return evalCache[moveIndex - 1]?.pvs || [];
+  }, [evalCache, moveIndex, displayEval]);
+
+  const customArrows = useMemo(() => {
+    // Review mode: show alternatives from the PREVIOUS position
+    const recs = recommendations;
+    if (!recs || recs.length === 0) return [];
+    
+    const playedMove = moves[moveIndex - 1];
+    const playedUci = playedMove ? playedMove.from + playedMove.to + (playedMove.promotion || '') : '';
+
+    return recs
+      .filter((pv) => pv && pv.move && pv.move.length >= 4)
+      .map((pv, i) => {
+        const from = pv.move.substring(0, 2) as Square;
+        const to = pv.move.substring(2, 4) as Square;
+        
+        const isValidSquare = (s: string) => /^[a-h][1-8]$/.test(s);
+        
+        if (isValidSquare(from) && isValidSquare(to)) {
+            const isBest = i === 0;
+            const isPlayed = pv.move === playedUci;
+            
+            // Highlight color: 
+            // - If it's the played move and it's best: Green
+            // - If it's the best move but NOT played: Strong Green (The 'Right' way)
+            // - Other top moves: Subtle Blue/Purple
+            let color = 'rgba(34, 197, 94, 0.9)'; 
+            if (!isBest) color = i === 1 ? 'rgba(59, 130, 246, 0.7)' : 'rgba(168, 85, 247, 0.7)';
+            
+            // If it's the move played, we can make it more subtle or skip if preferred
+            // But usually we want to see where the best move was compared to played
+            return [from, to, color] as [Square, Square, string];
+        }
+        return null;
+      })
+      .filter((arrow): arrow is [Square, Square, string] => arrow !== null);
+  }, [recommendations, moveIndex, moves]);
+
+  const lastMoveSquares = useMemo(() => {
+    if (moveIndex === 0) return {};
+    const lastMove = moves[moveIndex - 1];
+    if (!lastMove) return {};
+    return {
+      [lastMove.from]: { backgroundColor: 'rgba(255, 255, 0, 0.4)' },
+      [lastMove.to]: { backgroundColor: 'rgba(255, 255, 0, 0.4)' }
+    };
+  }, [moveIndex, moves]);
 
   return (
-    <div className="flex flex-col lg:flex-row gap-8 items-start animate-in fade-in duration-700">
-      {/* Eval Bar */}
-      <div className="w-8 h-[400px] lg:h-[600px] bg-slate-800 rounded-full relative overflow-hidden flex flex-col justify-end border-2 border-slate-200 shadow-inner">
-        <div className="bg-white transition-all duration-700 ease-in-out" style={{ height: barHeight }} />
-        <div className="absolute inset-0 flex flex-col items-center justify-between py-4 pointer-events-none">
-          <span className="text-[10px] font-bold text-white mix-blend-difference">
-            {currentEval?.type === 'mate' ? `M${currentEval.value}` : (currentEval?.value ? (currentEval.value / 100).toFixed(1) : '0.0')}
-          </span>
-        </div>
-      </div>
-
-      <div className="flex-1 flex flex-col gap-6">
-        <div className="relative group">
-          <div className="w-full max-w-[600px] aspect-square shadow-2xl rounded-lg overflow-hidden border-4 border-slate-200">
-            <Chessboard position={game.fen()} boardOrientation="white" animationDuration={200} />
-          </div>
-          {qualityInfo && (
-            <div className="absolute top-4 right-4 bg-white/90 backdrop-blur shadow-xl rounded-2xl p-4 flex items-center gap-3 border border-slate-100 animate-in zoom-in slide-in-from-top-2 duration-300">
-              <QualityIcon quality={qualityInfo.quality} />
-              <div>
-                <div className={`font-black text-sm uppercase tracking-wider ${qualityInfo.color}`}>{qualityInfo.label}</div>
-                <div className="text-[10px] text-slate-500 font-bold">{moves[moveIndex - 1]?.san}</div>
+    <div className="flex flex-col gap-8 animate-in fade-in duration-700">
+      {/* Header with Opening Info */}
+      <div className="flex flex-col gap-2 border-b border-slate-200 pb-6">
+        <Link href="/" className="text-slate-500 hover:text-slate-900 flex items-center gap-1 transition-colors text-sm font-medium mb-2">
+          <ChevronLeft size={16} /> Back to Games
+        </Link>
+        <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-black text-slate-900">Game Review</h1>
+            {opening && (
+              <div className="flex items-center gap-2 text-blue-600 font-bold mt-1">
+                <BookOpen size={18} />
+                <span className="text-sm tracking-tight">{opening}</span>
               </div>
-            </div>
-          )}
-        </div>
-
-        <div className="flex items-center justify-center gap-4 bg-white p-4 rounded-xl shadow-sm border border-slate-200 w-full max-w-[600px]">
-          <button onClick={handleFirst} className="p-2 hover:bg-slate-100 rounded-lg transition-colors"><ChevronsLeft size={24} /></button>
-          <button onClick={handlePrev} className="p-2 hover:bg-slate-100 rounded-lg transition-colors"><ChevronLeft size={24} /></button>
-          <div className="font-bold text-lg min-w-[80px] text-center">
-            {moveIndex === 0 ? 'Start' : `${Math.floor((moveIndex - 1) / 2) + 1}${moveIndex % 2 !== 0 ? '.' : '...'}`}
+            )}
           </div>
-          <button onClick={handleNext} className="p-2 hover:bg-slate-100 rounded-lg transition-colors"><ChevronRight size={24} /></button>
-          <button onClick={handleLast} className="p-2 hover:bg-slate-100 rounded-lg transition-colors"><ChevronsRight size={24} /></button>
+          <Link href="/" className="hidden md:block bg-slate-900 text-white px-6 py-2 rounded-xl text-center font-bold hover:bg-black transition-all shadow-lg active:scale-95 text-sm">
+            New Analysis
+          </Link>
         </div>
       </div>
 
-      <div className="w-full lg:w-80 flex flex-col gap-6 h-full">
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-          <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><BarChart2 size={24} /> Analysis</h2>
-          <div className="space-y-4">
-            <div className="flex justify-between items-center bg-slate-50 p-3 rounded-lg">
-              <span className="text-slate-500 font-medium">Evaluation</span>
-              <span className={`text-2xl font-black ${currentEval && (currentEval.type === 'mate' || currentEval.value > 0) ? 'text-green-600' : 'text-slate-900'}`}>
-                {currentEval ? (currentEval.type === 'mate' ? `M${Math.abs(currentEval.value)}` : (currentEval.value / 100).toFixed(2)) : '...'}
-              </span>
-            </div>
+      <div className="flex flex-col lg:flex-row gap-8 items-start">
+        {/* Eval Bar */}
+        <div className="w-8 h-[400px] lg:h-[600px] bg-slate-800 rounded-full relative overflow-hidden flex flex-col justify-end border-2 border-slate-200 shadow-inner">
+          <div className="bg-white transition-all duration-700 ease-in-out" style={{ height: barHeight }} />
+          <div className="absolute inset-0 flex flex-col items-center justify-between py-4 pointer-events-none">
+            <span className="text-[10px] font-bold text-white mix-blend-difference">
+              {displayEval?.type === 'mate' ? `M${Math.abs(displayEval.value)}` : (displayEval?.value ? (displayEval.value / 100).toFixed(1) : '0.0')}
+            </span>
           </div>
         </div>
 
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 max-h-[400px] flex flex-col">
-          <h3 className="font-bold mb-4">Moves <span className="text-[10px] bg-slate-100 px-2 py-1 rounded text-slate-500">{moves.length} total</span></h3>
-          <div className="grid grid-cols-2 gap-2 overflow-y-auto pr-2">
-            {moves.map((m, i) => (
-              <button
-                key={i}
-                onClick={() => goToMove(i + 1)}
-                className={`p-2 rounded text-left transition-all border flex items-center justify-between group ${moveIndex === i + 1 ? 'bg-blue-600 border-blue-600 text-white font-bold shadow-md' : 'hover:bg-slate-50 border-transparent text-slate-700'}`}
+        <div className="flex-1 flex flex-col gap-6">
+          <div className="relative group">
+            <div className="w-full max-w-[600px] aspect-square shadow-2xl rounded-lg overflow-hidden border-4 border-slate-200 relative">
+              <Chessboard 
+                position={game.fen()} 
+                boardOrientation={boardOrientation} 
+                animationDuration={0} 
+                customArrows={customArrows}
+                customSquareStyles={lastMoveSquares}
+              />
+              <button 
+                onClick={() => setBoardOrientation(prev => prev === 'white' ? 'black' : 'white')}
+                className="absolute bottom-4 right-4 bg-slate-900/80 hover:bg-slate-900 text-white p-2 rounded-full backdrop-blur transition-all shadow-lg z-10"
+                title="Flip Board"
               >
-                <span className="truncate">
-                  <span className={`text-[10px] mr-1 ${moveIndex === i + 1 ? 'text-blue-200' : 'text-slate-400'}`}>
-                    {Math.floor(i / 2) + 1}{i % 2 === 0 ? '.' : '...'}
-                  </span>
-                  {m.san}
-                </span>
-                {moveIndex === i + 1 && <ChevronRight size={14} className="animate-pulse" />}
+                <RefreshCw size={20} />
               </button>
-            ))}
+            </div>
+            {qualityInfo && (
+              <div className="absolute top-4 right-4 bg-white/90 backdrop-blur shadow-xl rounded-2xl p-4 flex items-center gap-3 border border-slate-100 animate-in zoom-in slide-in-from-top-2 duration-300">
+                <QualityIcon quality={qualityInfo.quality} />
+                <div>
+                  <div className={`font-black text-sm uppercase tracking-wider ${qualityInfo.color}`}>{qualityInfo.label}</div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] text-slate-500 font-bold">{moves[moveIndex - 1]?.san}</span>
+                    {qualityInfo.bestMove && (
+                        <span className="text-[10px] text-blue-600 font-black bg-blue-50 px-1.5 py-0.5 rounded">
+                          Best was {formatUci(qualityInfo.bestMove)}
+                        </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center justify-center gap-4 bg-white p-4 rounded-xl shadow-sm border border-slate-200 w-full max-w-[600px]">
+            <button onClick={handleFirst} className="p-2 hover:bg-slate-100 rounded-lg transition-colors"><ChevronsLeft size={24} /></button>
+            <button onClick={handlePrev} className="p-2 hover:bg-slate-100 rounded-lg transition-colors"><ChevronLeft size={24} /></button>
+            <div className="font-bold text-lg min-w-[80px] text-center">
+              {moveIndex === 0 ? 'Start' : `${Math.floor((moveIndex - 1) / 2) + 1}${moveIndex % 2 !== 0 ? '.' : '...'}`}
+            </div>
+            <button onClick={handleNext} className="p-2 hover:bg-slate-100 rounded-lg transition-colors"><ChevronRight size={24} /></button>
+            <button onClick={handleLast} className="p-2 hover:bg-slate-100 rounded-lg transition-colors"><ChevronsRight size={24} /></button>
           </div>
         </div>
-        <Link href="/" className="bg-slate-900 text-white p-4 rounded-xl text-center font-bold hover:bg-black transition-all shadow-lg active:scale-95">New Analysis</Link>
+
+        <div className="w-full lg:w-80 flex flex-col gap-6 h-full">
+          <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+            <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
+              <BarChart2 size={24} /> 
+              Move Analysis
+            </h2>
+            <div className="space-y-4">
+              <div className="flex justify-between items-center bg-slate-50 p-3 rounded-lg">
+                <span className="text-slate-500 font-medium">Current Eval</span>
+                <span className={`text-2xl font-black ${displayEval && (displayEval.type === 'mate' || displayEval.value > 0) ? 'text-green-600' : 'text-slate-900'}`}>
+                  {displayEval ? (displayEval.type === 'mate' ? `M${Math.abs(displayEval.value)}` : (displayEval.value / 100).toFixed(2)) : '...'}
+                </span>
+              </div>
+
+              {/* Recommendations for the move played */}
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5 text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">
+                  <Lightbulb size={12} className="text-yellow-500" />
+                  {moveIndex > 0 ? `Alternatives for Move ${moveIndex}` : 'Engine Recommendations'}
+                </div>
+                {recommendations.length > 0 ? recommendations.map((pv, i) => (
+                  <div key={i} className="flex items-center justify-between text-sm bg-slate-50/50 p-2 rounded-lg border border-slate-100 group hover:border-blue-200 transition-colors">
+                    <div className="flex items-center gap-2">
+                      <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${i === 0 ? 'bg-green-100 text-green-700' : 'bg-slate-200 text-slate-500'}`}>
+                        {i + 1}
+                      </span>
+                      <span className="font-mono font-bold text-slate-700">{formatUci(pv.move)}</span>
+                    </div>
+                    <span className={`text-[11px] font-black ${pv.value >= 0 ? 'text-green-600' : 'text-slate-500'}`}>
+                      {pv.type === 'mate' ? `M${Math.abs(pv.value)}` : (pv.value / 100).toFixed(1)}
+                    </span>
+                  </div>
+                )) : (
+                  <div className="text-xs text-slate-400 italic py-2">Calculating alternatives...</div>
+                )}
+              </div>
+
+              {displayEval?.depth && (
+                <div className="flex justify-between items-center text-[10px] text-slate-400 font-bold uppercase tracking-wider pt-2 border-t border-slate-100">
+                  <span>Depth: {displayEval.depth}</span>
+                  {displayEval.knps && <span>{Math.round(displayEval.knps / 1000)} MN/s</span>}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 max-h-[400px] flex flex-col">
+            <h3 className="font-bold mb-4">Moves <span className="text-[10px] bg-slate-100 px-2 py-1 rounded text-slate-500">{moves.length} total</span></h3>
+            <div className="grid grid-cols-2 gap-2 overflow-y-auto pr-2">
+              {moves.map((m, i) => (
+                <button
+                  key={i}
+                  onClick={() => setMoveIndex(i + 1)}
+                  className={`p-2 rounded text-left transition-all border flex items-center justify-between group ${moveIndex === i + 1 ? 'bg-blue-600 border-blue-600 text-white font-bold shadow-md' : 'hover:bg-slate-50 border-transparent text-slate-700'}`}
+                >
+                  <span className="truncate">
+                    <span className={`text-[10px] mr-1 ${moveIndex === i + 1 ? 'text-blue-200' : 'text-slate-400'}`}>
+                      {Math.floor(i / 2) + 1}{i % 2 === 0 ? '.' : '...'}
+                    </span>
+                    {m.san}
+                  </span>
+                  {moveIndex === i + 1 && <ChevronRight size={14} className="animate-pulse" />}
+                </button>
+              ))}
+            </div>
+          </div>
+          <Link href="/" className="bg-slate-900 text-white p-4 rounded-xl text-center font-bold hover:bg-black transition-all shadow-lg active:scale-95 text-sm">New Analysis</Link>
+        </div>
       </div>
     </div>
   );
@@ -263,10 +462,6 @@ export default function AnalysisPage() {
   return (
     <main className="min-h-screen bg-slate-50 p-4 lg:p-8">
       <div className="max-w-7xl mx-auto">
-        <header className="mb-8">
-           <Link href="/" className="text-slate-500 hover:text-slate-900 flex items-center gap-1 transition-colors text-sm font-medium mb-2"><ChevronLeft size={16} /> Back to Games</Link>
-           <h1 className="text-3xl font-black text-slate-900">Game Review</h1>
-        </header>
         <Suspense fallback={<div className="flex flex-col items-center justify-center h-[600px] gap-4"><Loader2 className="w-12 h-12 text-blue-600 animate-spin" /></div>}>
           <AnalysisContent />
         </Suspense>
