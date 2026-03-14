@@ -7,7 +7,7 @@ export interface Evaluation {
   isBook?: boolean;
   depth?: number;
   isCloud?: boolean;
-  pvs?: Array<{ type: 'cp' | 'mate'; value: number; move: string }>;
+  pvs?: Array<{ type: 'cp' | 'mate'; value: number; move: string, variation?: string }>;
 }
 
 export function useStockfish() {
@@ -16,6 +16,7 @@ export function useStockfish() {
   const workerRef = useRef<Worker | null>(null);
   const resolveRef = useRef<((value: Evaluation) => void) | null>(null);
   const lastEvalRef = useRef<Evaluation | null>(null);
+  const currentFenRef = useRef<string | null>(null);
 
   useEffect(() => {
     const worker = new Worker('/stockfish.js');
@@ -29,35 +30,35 @@ export function useStockfish() {
         setIsReady(true);
       } else if (line.startsWith('info depth')) {
         const scoreMatch = line.match(/score (cp|mate) (-?\d+)/);
-        const pvMatch = line.match(/pv (\w+)/);
+        const pvMatch = line.match(/pv (.+)/); 
         const multiPvMatch = line.match(/multipv (\d+)/);
         const depthMatch = line.match(/depth (\d+)/);
         
         if (scoreMatch) {
           const type = scoreMatch[1] as 'cp' | 'mate';
           const value = parseInt(scoreMatch[2]);
-          const move = pvMatch ? pvMatch[1] : undefined;
+          const pv = pvMatch ? pvMatch[1] : undefined;
           const multiPv = multiPvMatch ? parseInt(multiPvMatch[1]) : 1;
           const depth = depthMatch ? parseInt(depthMatch[1]) : undefined;
+          const firstMove = pv ? pv.split(' ')[0] : undefined;
           
           if (!lastEvalRef.current) {
-            lastEvalRef.current = { type, value, bestMove: move, pvs: [], depth, isCloud: false };
+            lastEvalRef.current = { type, value, bestMove: firstMove, pvs: [], depth, isCloud: false };
           }
           
           if (!lastEvalRef.current.pvs) {
             lastEvalRef.current.pvs = [];
           }
           
-          if (move) {
-            lastEvalRef.current.pvs[multiPv - 1] = { type, value, move };
+          if (pv) {
+            lastEvalRef.current.pvs[multiPv - 1] = { type, value, move: firstMove || '', variation: pv };
           }
           
           if (multiPv === 1) {
             lastEvalRef.current.type = type;
             lastEvalRef.current.value = value;
-            lastEvalRef.current.bestMove = move;
+            lastEvalRef.current.bestMove = firstMove;
             lastEvalRef.current.depth = depth;
-            console.log(`Stockfish Eval: ${type === 'mate' ? 'M' : ''}${value} | Best: ${move} | Depth: ${depth}`);
           }
           
           setEvaluation({...lastEvalRef.current});
@@ -79,14 +80,16 @@ export function useStockfish() {
     };
   }, []);
 
-  const analyze = useCallback((fen: string, depth: number = 10): Promise<Evaluation> => {
+  const analyze = useCallback((fen: string, depth: number = 24): Promise<Evaluation> => {
     return new Promise((resolve) => {
       if (!workerRef.current || !isReady) {
         resolve({ type: 'cp', value: 0 });
         return;
       }
       
-      // Clear previous resolve if any
+      currentFenRef.current = fen;
+      workerRef.current.postMessage('stop');
+      
       if (resolveRef.current) {
         resolveRef.current(lastEvalRef.current || { type: 'cp', value: 0 });
       }
@@ -94,6 +97,7 @@ export function useStockfish() {
       setEvaluation(null);
       lastEvalRef.current = null;
       resolveRef.current = resolve;
+      
       workerRef.current.postMessage(`position fen ${fen}`);
       workerRef.current.postMessage(`go depth ${depth}`);
     });

@@ -24,6 +24,22 @@ interface CloudEvalData {
   };
 }
 
+interface OpeningMove {
+  uci: string;
+  san: string;
+  white: number;
+  draws: number;
+  black: number;
+}
+
+interface OpeningData {
+  opening?: {
+    eco: string;
+    name: string;
+  };
+  moves: OpeningMove[];
+}
+
 interface ExtendedEvaluation extends Evaluation {
   knps?: number;
 }
@@ -89,8 +105,10 @@ function AnalysisContent() {
   const searchParams = useSearchParams();
   const pgn = searchParams.get('pgn');
   const [opening, setOpening] = useState<string>('');
+  const [openingData, setOpeningData] = useState<OpeningData | null>(null);
   const [evalCache, setEvalCache] = useState<Record<number, ExtendedEvaluation>>({});
   const evalCacheRef = useRef<Record<number, ExtendedEvaluation>>({});
+  const lastRequestIdRef = useRef<number>(0);
   
   const moves = useMemo<Move[]>(() => {
     if (!pgn) return [];
@@ -107,6 +125,7 @@ function AnalysisContent() {
   const [moveIndex, setMoveIndex] = useState(0);
   const [boardOrientation, setBoardOrientation] = useState<'white' | 'black'>('white');
   const [cloudEval, setCloudEval] = useState<CloudEvalData | null>(null);
+  const [hoveredVariation, setHoveredVariation] = useState<string | null>(null);
   const { analyze, isReady, evaluation: liveEval, stop } = useStockfish();
 
   const game = useMemo(() => {
@@ -119,7 +138,11 @@ function AnalysisContent() {
 
   const updateCache = (index: number, evaluation: ExtendedEvaluation) => {
     const current = evalCacheRef.current[index];
-    if (!current || (evaluation.depth && (!current.depth || evaluation.depth > current.depth))) {
+    const isNewBetter = !current || 
+      (evaluation.isBook && !current.isBook) ||
+      (evaluation.depth && (!current.depth || evaluation.depth > current.depth));
+
+    if (isNewBetter) {
       evalCacheRef.current[index] = { ...current, ...evaluation };
       setEvalCache({ ...evalCacheRef.current });
     }
@@ -127,12 +150,16 @@ function AnalysisContent() {
 
   // Fetch Opening Name and Cloud Eval
   useEffect(() => {
+    const requestId = ++lastRequestIdRef.current;
+    const controller = new AbortController();
+
     const fetchAnalysisData = async () => {
       const fen = game.fen();
       const currentIndex = moveIndex;
 
       // Don't fetch if game is over
       if (game.isGameOver()) {
+        if (requestId !== lastRequestIdRef.current) return;
         const result: ExtendedEvaluation = game.isCheckmate() 
           ? { type: 'mate', value: game.turn() === 'w' ? -0 : 0, depth: 0 }
           : { type: 'cp', value: 0, depth: 0 };
@@ -143,10 +170,10 @@ function AnalysisContent() {
       // Fetch Cloud Eval
       setCloudEval(null);
       try {
-        const res = await fetch(`/api/lichess?fen=${encodeURIComponent(fen)}&type=cloud-eval`);
+        const res = await fetch(`/api/lichess?fen=${encodeURIComponent(fen)}&type=cloud-eval`, { signal: controller.signal });
         if (res.ok) {
           const data = await res.json() as CloudEvalData | null;
-          if (data) {
+          if (data && requestId === lastRequestIdRef.current) {
             setCloudEval(data);
             updateCache(currentIndex, {
               type: (data.pvs[0].cp !== undefined ? 'cp' : 'mate'),
@@ -162,33 +189,65 @@ function AnalysisContent() {
           }
         }
       } catch (e) {
-        console.error('Cloud Eval error', e);
+        if (e instanceof Error && e.name !== 'AbortError') {
+          console.error('Cloud Eval error', e);
+        }
       }
 
       // Fetch Opening Explorer data for opening name
       try {
-        const res = await fetch(`/api/lichess?fen=${encodeURIComponent(fen)}&type=explorer`);
+        const res = await fetch(`/api/lichess?fen=${encodeURIComponent(fen)}&type=explorer`, { signal: controller.signal });
         if (res.ok) {
-          const data = await res.json();
-          if (data && data.opening) {
-            setOpening(`${data.opening.eco}: ${data.opening.name}`);
-            updateCache(currentIndex, { isBook: true, type: 'cp', value: 0 });
+          const data = await res.json() as OpeningData | null;
+          if (data && requestId === lastRequestIdRef.current) {
+            if (data.opening) {
+              setOpening(`${data.opening.eco}: ${data.opening.name}`);
+            }
+            setOpeningData(data);
+            
+            // If we have book moves, mark as book and potentially skip engine
+            if (data.moves && data.moves.length > 0) {
+              updateCache(currentIndex, { 
+                isBook: true, 
+                type: 'cp', 
+                value: 0,
+                pvs: data.moves.map(m => ({
+                  type: 'cp',
+                  value: 0,
+                  move: m.uci
+                }))
+              });
+            }
           }
         }
       } catch (e) {
-        console.error('Opening Explorer error', e);
+        if (e instanceof Error && e.name !== 'AbortError') {
+          console.error('Opening Explorer error', e);
+        }
       }
     };
+
     fetchAnalysisData();
+    return () => controller.abort();
   }, [game, moveIndex]);
 
   // Real-time continuous analysis
   useEffect(() => {
+    // Stage 1: Optimize engine usage based on game phase
+    const isEarlyGame = moveIndex <= 15;
+    const hasBookMoves = openingData && openingData.moves && openingData.moves.length > 0;
+    
     if (isReady && game) {
-      analyze(game.fen(), 24);
+      if (isEarlyGame && hasBookMoves) {
+        // Run a shallow analysis if we're in the opening with known stats
+        analyze(game.fen(), 12);
+      } else {
+        // Deep analysis for middle/endgame
+        analyze(game.fen(), 24);
+      }
       return () => stop();
     }
-  }, [game, isReady, analyze, stop]);
+  }, [game, isReady, analyze, stop, moveIndex, openingData]);
 
   // Update cache from live engine
   useEffect(() => {
@@ -234,6 +293,22 @@ function AnalysisContent() {
     return uci.substring(0, 2) + ' → ' + uci.substring(2, 4);
   };
 
+  const WinLossBar = ({ white, draws, black }: { white: number, draws: number, black: number }) => {
+    const total = white + draws + black;
+    if (total === 0) return null;
+    const w = (white / total) * 100;
+    const d = (draws / total) * 100;
+    const b = (black / total) * 100;
+    
+    return (
+      <div className="h-1.5 w-full flex rounded-full overflow-hidden mt-1 bg-slate-100">
+        <div className="bg-white border-r border-slate-200" style={{ width: `${w}%` }} title={`White wins: ${Math.round(w)}%`} />
+        <div className="bg-slate-400" style={{ width: `${d}%` }} title={`Draws: ${Math.round(d)}%`} />
+        <div className="bg-slate-900" style={{ width: `${b}%` }} title={`Black wins: ${Math.round(b)}%`} />
+      </div>
+    );
+  };
+
   const qualityInfo = useMemo<QualityInfo | null>(() => {
     if (moveIndex === 0) return null;
     const current = evalCache[moveIndex];
@@ -259,12 +334,21 @@ function AnalysisContent() {
   }, [evalCache, moveIndex, displayEval]);
 
   const customArrows = useMemo(() => {
+    // If hovering over a variation, show it
+    if (hoveredVariation) {
+      const variationMoves = hoveredVariation.split(' ').slice(0, 3); // Show first 3 moves
+      return variationMoves.map((m, i) => {
+        const from = m.substring(0, 2) as Square;
+        const to = m.substring(2, 4) as Square;
+        const opacity = 0.8 - (i * 0.2);
+        const color = `rgba(59, 130, 246, ${opacity})`; // Blue variation
+        return [from, to, color] as [Square, Square, string];
+      }).filter((a): a is [Square, Square, string] => /^[a-h][1-8]$/.test(a[0]) && /^[a-h][1-8]$/.test(a[1]));
+    }
+
     // Review mode: show alternatives from the PREVIOUS position
     const recs = recommendations;
     if (!recs || recs.length === 0) return [];
-    
-    const playedMove = moves[moveIndex - 1];
-    const playedUci = playedMove ? playedMove.from + playedMove.to + (playedMove.promotion || '') : '';
 
     return recs
       .filter((pv) => pv && pv.move && pv.move.length >= 4)
@@ -276,23 +360,29 @@ function AnalysisContent() {
         
         if (isValidSquare(from) && isValidSquare(to)) {
             const isBest = i === 0;
-            const isPlayed = pv.move === playedUci;
+            
+            // Check if this move was from Opening Explorer
+            const prevEval = moveIndex > 0 ? evalCache[moveIndex - 1] : null;
+            const isBook = prevEval?.isBook;
             
             // Highlight color: 
-            // - If it's the played move and it's best: Green
-            // - If it's the best move but NOT played: Strong Green (The 'Right' way)
-            // - Other top moves: Subtle Blue/Purple
-            let color = 'rgba(34, 197, 94, 0.9)'; 
-            if (!isBest) color = i === 1 ? 'rgba(59, 130, 246, 0.7)' : 'rgba(168, 85, 247, 0.7)';
+            // - Blue for Book moves (with decreasing opacity for lower priority)
+            // - Green for Engine Best move
+            // - Subtle Blue/Purple for other engine moves
+            let color = 'rgba(34, 197, 94, 0.8)'; // Engine Green
+            if (isBook) {
+              const opacity = 0.9 - (i * 0.2); // First: 0.9, Second: 0.7, etc.
+              color = `rgba(59, 130, 246, ${Math.max(0.3, opacity)})`; // Opening Blue
+            } else if (!isBest) {
+              color = i === 1 ? 'rgba(168, 85, 247, 0.7)' : 'rgba(168, 85, 247, 0.4)'; // Engine alternatives (Purple)
+            }
             
-            // If it's the move played, we can make it more subtle or skip if preferred
-            // But usually we want to see where the best move was compared to played
             return [from, to, color] as [Square, Square, string];
         }
         return null;
       })
       .filter((arrow): arrow is [Square, Square, string] => arrow !== null);
-  }, [recommendations, moveIndex, moves]);
+  }, [recommendations, moveIndex, moves, evalCache, hoveredVariation]);
 
   const lastMoveSquares = useMemo(() => {
     if (moveIndex === 0) return {};
@@ -357,7 +447,7 @@ function AnalysisContent() {
               </button>
             </div>
             {qualityInfo && (
-              <div className="absolute top-4 right-4 bg-white/90 backdrop-blur shadow-xl rounded-2xl p-4 flex items-center gap-3 border border-slate-100 animate-in zoom-in slide-in-from-top-2 duration-300">
+              <div className={`absolute top-4 right-4 bg-white/90 backdrop-blur shadow-xl rounded-2xl p-4 flex items-center gap-3 border transition-all duration-300 animate-in zoom-in slide-in-from-top-2 ${qualityInfo.quality === 'blunder' ? 'border-red-500 animate-bounce shadow-red-200' : 'border-slate-100'}`}>
                 <QualityIcon quality={qualityInfo.quality} />
                 <div>
                   <div className={`font-black text-sm uppercase tracking-wider ${qualityInfo.color}`}>{qualityInfo.label}</div>
@@ -405,10 +495,39 @@ function AnalysisContent() {
                   <Lightbulb size={12} className="text-yellow-500" />
                   {moveIndex > 0 ? `Alternatives for Move ${moveIndex}` : 'Engine Recommendations'}
                 </div>
-                {recommendations.length > 0 ? recommendations.map((pv, i) => (
-                  <div key={i} className="flex items-center justify-between text-sm bg-slate-50/50 p-2 rounded-lg border border-slate-100 group hover:border-blue-200 transition-colors">
+                
+                {/* Show Opening Explorer data if in book */}
+                {openingData && openingData.moves && openingData.moves.length > 0 ? (
+                  <div className="space-y-2 mb-4">
+                    <div className="text-[9px] font-bold text-blue-500 flex items-center gap-1 mb-2">
+                      <BookOpen size={10} /> Opening Stats (Lichess)
+                    </div>
+                    {openingData.moves.map((m) => (
+                      <div key={m.uci} className="flex flex-col bg-blue-50/30 p-2 rounded-lg border border-blue-100/50 hover:border-blue-300 transition-colors">
+                        <div className="flex items-center justify-between text-xs mb-1">
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-slate-700">{m.san}</span>
+                            <span className="text-[10px] text-slate-400 font-mono">{formatUci(m.uci)}</span>
+                          </div>
+                          <span className="text-[10px] font-bold text-slate-500">{m.white + m.draws + m.black} games</span>
+                        </div>
+                        <WinLossBar white={m.white} draws={m.draws} black={m.black} />
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {recommendations.length > 0 ? recommendations
+                  .filter(pv => !openingData?.moves.some(m => m.uci === pv.move)) // Only show engine moves NOT in explorer
+                  .map((pv, i) => (
+                  <div 
+                    key={i} 
+                    onMouseEnter={() => pv.variation && setHoveredVariation(pv.variation)}
+                    onMouseLeave={() => setHoveredVariation(null)}
+                    className="flex items-center justify-between text-sm bg-slate-50/50 p-2 rounded-lg border border-slate-100 group hover:border-blue-200 transition-colors cursor-pointer"
+                  >
                     <div className="flex items-center gap-2">
-                      <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${i === 0 ? 'bg-green-100 text-green-700' : 'bg-slate-200 text-slate-500'}`}>
+                      <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${i === 0 && !openingData?.moves.length ? 'bg-green-100 text-green-700' : 'bg-slate-200 text-slate-500'}`}>
                         {i + 1}
                       </span>
                       <span className="font-mono font-bold text-slate-700">{formatUci(pv.move)}</span>
@@ -417,9 +536,9 @@ function AnalysisContent() {
                       {pv.type === 'mate' ? `M${Math.abs(pv.value)}` : (pv.value / 100).toFixed(1)}
                     </span>
                   </div>
-                )) : (
+                )) : (!openingData?.moves.length && (
                   <div className="text-xs text-slate-400 italic py-2">Calculating alternatives...</div>
-                )}
+                ))}
               </div>
 
               {displayEval?.depth && (

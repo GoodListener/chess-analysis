@@ -18,7 +18,7 @@ export async function GET(request: NextRequest) {
       url = `https://lichess.org/api/cloud-eval?fen=${encodeURIComponent(fen)}`;
     } else {
       // explorer
-      url = `https://explorer.lichess.ovh/lichess?fen=${encodeURIComponent(fen)}&moves=0`;
+      url = `https://explorer.lichess.ovh/lichess?fen=${encodeURIComponent(fen)}&moves=5&topGames=0`;
     }
 
     const res = await fetch(url, { headers });
